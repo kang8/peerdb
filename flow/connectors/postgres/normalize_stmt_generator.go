@@ -163,8 +163,8 @@ func (n *normalizeStmtGenerator) generateMergeStatement(
 	// For jsonb_to_record path we build:
 	//   recordDefs  – column definitions for the AS clause of jsonb_to_record (in the CTE)
 	//   selectExprs – the SELECT list in the USING subquery, referencing columns from src_rank.
-	//                 json/jsonb columns are wrapped with _peerdb_parse_jsonb/_peerdb_parse_json
-	//                 to unwrap PeerDB's stringified representation.
+	//                 json/jsonb columns use inline (#>> '{}')::type to unwrap
+	//                 PeerDB's stringified representation.
 	// For legacy path we only build selectExprs (flattened casts via ->>).
 	selectExprs := make([]string, 0, columnCount)
 	recordDefs := make([]string, 0, columnCount)
@@ -207,12 +207,33 @@ func (n *normalizeStmtGenerator) generateMergeStatement(
 	}
 
 	updateStatementsforToastCols := n.generateUpdateStatements(quotedColumnNames, unchangedToastColumns)
+	// append synced_at column
+	if n.peerdbCols.SyncedAtColName != "" {
+		quotedColumnNames = append(quotedColumnNames, common.QuoteIdentifier(n.peerdbCols.SyncedAtColName))
+		insertValuesSQLArray = append(insertValuesSQLArray, "CURRENT_TIMESTAMP")
+	}
 	insertColumnsSQL := strings.Join(quotedColumnNames, ",")
 	insertValuesSQL := strings.Join(insertValuesSQLArray, ",")
 
+	if n.peerdbCols.SoftDeleteColName != "" {
+		softDeleteInsertColumnsSQL := strings.Join(
+			append(quotedColumnNames, common.QuoteIdentifier(n.peerdbCols.SoftDeleteColName)), ",")
+		softDeleteInsertValuesSQL := strings.Join(append(insertValuesSQLArray, "TRUE"), ",")
+
+		updateStatementsforToastCols = append(updateStatementsforToastCols,
+			fmt.Sprintf("WHEN NOT MATCHED AND (src._peerdb_record_type=2) THEN INSERT (%s) VALUES(%s)",
+				softDeleteInsertColumnsSQL, softDeleteInsertValuesSQL))
+	}
 	updateStringToastCols := strings.Join(updateStatementsforToastCols, "\n")
 
 	conflictPart := "DELETE"
+	if n.peerdbCols.SoftDeleteColName != "" {
+		colName := n.peerdbCols.SoftDeleteColName
+		conflictPart = fmt.Sprintf(`UPDATE SET %s=TRUE`, common.QuoteIdentifier(colName))
+		if n.peerdbCols.SyncedAtColName != "" {
+			conflictPart += fmt.Sprintf(`,%s=CURRENT_TIMESTAMP`, common.QuoteIdentifier(n.peerdbCols.SyncedAtColName))
+		}
+	}
 
 	var mergeStmt string
 	if useJsonbToRecord {
