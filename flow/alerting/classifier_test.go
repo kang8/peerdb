@@ -107,21 +107,25 @@ func TestClickHouseSelectFromDestinationDuringQrepAsMvError(t *testing.T) {
 	}, errInfo, "Unexpected error info")
 }
 
-func TestPostgresWalRemovedErrorShouldBeRecoverable(t *testing.T) {
-	// Simulate a WAL removed error
-	err := &exceptions.PostgresWalError{
-		Msg: &pgproto3.ErrorResponse{
-			Severity: "ERROR",
-			Code:     pgerrcode.InternalError,
-			Message:  "requested WAL segment 000000010001337F0000002E has already been removed",
-		},
+func TestPostgresWalRemovedErrorShouldBeNotifyUser(t *testing.T) {
+	for _, code := range []string{pgerrcode.InternalError, pgerrcode.UndefinedFile} {
+		t.Run(code, func(t *testing.T) {
+			// Simulate a WAL removed error
+			err := &exceptions.PostgresWalError{
+				Msg: &pgproto3.ErrorResponse{
+					Severity: "ERROR",
+					Code:     code,
+					Message:  "requested WAL segment 000000010001337F0000002E has already been removed",
+				},
+			}
+			errorClass, errInfo := GetErrorClass(t.Context(), fmt.Errorf("error in WAL: %w", err))
+			assert.Equal(t, ErrorNotifyWalSegmentRemoved, errorClass, "Unexpected error class")
+			assert.Equal(t, ErrorInfo{
+				Source: ErrorSourcePostgres,
+				Code:   code,
+			}, errInfo, "Unexpected error info")
+		})
 	}
-	errorClass, errInfo := GetErrorClass(t.Context(), fmt.Errorf("error in WAL: %w", err))
-	assert.Equal(t, ErrorRetryRecoverable, errorClass, "Unexpected error class")
-	assert.Equal(t, ErrorInfo{
-		Source: ErrorSourcePostgres,
-		Code:   pgerrcode.InternalError,
-	}, errInfo, "Unexpected error info")
 }
 
 func TestAuroraInternalWALErrorShouldBeRecoverable(t *testing.T) {
@@ -943,6 +947,21 @@ func TestMongoClientDisconnectedShouldBeInternal(t *testing.T) {
 		Source: ErrorSourceMongoDB,
 		Code:   "CLIENT_DISCONNECTED",
 	}, errInfo, "Unexpected error info")
+}
+
+func TestYugabyteDBSnapshotExportDisabledShouldBeSnapshotExportDisabled(t *testing.T) {
+	err := &pgconn.PgError{
+		Severity: "ERROR",
+		Code:     pgerrcode.SyntaxError,
+		Message:  "cannot export or import snapshot when ysql_enable_pg_export_snapshot is disabled.",
+	}
+	errorClass, errInfo := GetErrorClass(t.Context(),
+		fmt.Errorf("failed to set transaction snapshot: %w", err))
+	assert.Equal(t, ErrorNotifySnapshotExportDisabled, errorClass)
+	assert.Equal(t, ErrorInfo{
+		Source: ErrorSourcePostgres,
+		Code:   pgerrcode.SyntaxError,
+	}, errInfo)
 }
 
 func TestAuroraFailoverRONodeShouldBeRecoverable(t *testing.T) {
