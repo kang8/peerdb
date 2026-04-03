@@ -153,73 +153,104 @@ func (n *normalizeStmtGenerator) generateMergeStatement(
 	columnCount := len(normalizedTableSchema.Columns)
 	quotedColumnNames := make([]string, columnCount)
 
-	flattenedCastsSQLArray := make([]string, 0, columnCount)
 	parsedDstTable, _ := common.ParseTableIdentifier(dstTableName)
 
 	primaryKeyColumnCasts := make(map[string]string)
 	primaryKeySelectSQLArray := make([]string, 0, len(normalizedTableSchema.PrimaryKeyColumns))
+
+	useJsonbToRecord := normalizedTableSchema.System == protos.TypeSystem_PG
+
+	// For jsonb_to_record path we build:
+	//   recordDefs  – column definitions for the AS clause of jsonb_to_record (in the CTE)
+	//   selectExprs – the SELECT list in the USING subquery, referencing columns from src_rank.
+	//                 json/jsonb columns are wrapped with _peerdb_parse_jsonb/_peerdb_parse_json
+	//                 to unwrap PeerDB's stringified representation.
+	// For legacy path we only build selectExprs (flattened casts via ->>).
+	selectExprs := make([]string, 0, columnCount)
+	recordDefs := make([]string, 0, columnCount)
+
 	for i, column := range normalizedTableSchema.Columns {
-		genericColumnType := column.Type
 		quotedCol := common.QuoteIdentifier(column.Name)
 		stringCol := utils.QuoteLiteral(column.Name)
 		quotedColumnNames[i] = quotedCol
 		pgType := n.columnTypeToPg(normalizedTableSchema, column)
-		expr := n.generateExpr(normalizedTableSchema, genericColumnType, stringCol, pgType)
 
-		flattenedCastsSQLArray = append(flattenedCastsSQLArray, fmt.Sprintf("%s AS %s", expr, quotedCol))
+		if useJsonbToRecord {
+			// json/jsonb columns are stored as stringified text inside _peerdb_data,
+			// so jsonb_to_record extracts them as a jsonb string wrapper.
+			// Include them in the record as jsonb, then unwrap in the USING SELECT.
+			if column.Type == "json" {
+				recordDefs = append(recordDefs, fmt.Sprintf("%s jsonb", quotedCol))
+				selectExprs = append(selectExprs, fmt.Sprintf("(%s #>> '{}')::json AS %s", quotedCol, quotedCol))
+			} else if column.Type == "jsonb" {
+				recordDefs = append(recordDefs, fmt.Sprintf("%s jsonb", quotedCol))
+				selectExprs = append(selectExprs, fmt.Sprintf("(%s #>> '{}')::jsonb AS %s", quotedCol, quotedCol))
+			} else {
+				recordDefs = append(recordDefs, fmt.Sprintf("%s %s", quotedCol, pgType))
+				selectExprs = append(selectExprs, quotedCol)
+			}
+		} else {
+			genericColumnType := column.Type
+			expr := n.generateExpr(normalizedTableSchema, genericColumnType, stringCol, pgType)
+			selectExprs = append(selectExprs, fmt.Sprintf("%s AS %s", expr, quotedCol))
+		}
+
 		if slices.Contains(normalizedTableSchema.PrimaryKeyColumns, column.Name) {
 			primaryKeyColumnCasts[column.Name] = fmt.Sprintf("(_peerdb_data->>%s)::%s", stringCol, pgType)
 			primaryKeySelectSQLArray = append(primaryKeySelectSQLArray, fmt.Sprintf("src.%s=dst.%s", quotedCol, quotedCol))
 		}
 	}
-	flattenedCastsSQL := strings.Join(flattenedCastsSQLArray, ",")
+	selectExprsSQL := strings.Join(selectExprs, ",")
 	insertValuesSQLArray := make([]string, 0, columnCount+2)
 	for _, quotedCol := range quotedColumnNames {
 		insertValuesSQLArray = append(insertValuesSQLArray, "src."+quotedCol)
 	}
 
 	updateStatementsforToastCols := n.generateUpdateStatements(quotedColumnNames, unchangedToastColumns)
-	// append synced_at column
-	if n.peerdbCols.SyncedAtColName != "" {
-		quotedColumnNames = append(quotedColumnNames, common.QuoteIdentifier(n.peerdbCols.SyncedAtColName))
-		insertValuesSQLArray = append(insertValuesSQLArray, "CURRENT_TIMESTAMP")
-	}
 	insertColumnsSQL := strings.Join(quotedColumnNames, ",")
 	insertValuesSQL := strings.Join(insertValuesSQLArray, ",")
 
-	if n.peerdbCols.SoftDeleteColName != "" {
-		softDeleteInsertColumnsSQL := strings.Join(
-			append(quotedColumnNames, common.QuoteIdentifier(n.peerdbCols.SoftDeleteColName)), ",")
-		softDeleteInsertValuesSQL := strings.Join(append(insertValuesSQLArray, "TRUE"), ",")
-
-		updateStatementsforToastCols = append(updateStatementsforToastCols,
-			fmt.Sprintf("WHEN NOT MATCHED AND (src._peerdb_record_type=2) THEN INSERT (%s) VALUES(%s)",
-				softDeleteInsertColumnsSQL, softDeleteInsertValuesSQL))
-	}
 	updateStringToastCols := strings.Join(updateStatementsforToastCols, "\n")
 
 	conflictPart := "DELETE"
-	if n.peerdbCols.SoftDeleteColName != "" {
-		colName := n.peerdbCols.SoftDeleteColName
-		conflictPart = fmt.Sprintf(`UPDATE SET %s=TRUE`, common.QuoteIdentifier(colName))
-		if n.peerdbCols.SyncedAtColName != "" {
-			conflictPart += fmt.Sprintf(`,%s=CURRENT_TIMESTAMP`, common.QuoteIdentifier(n.peerdbCols.SyncedAtColName))
-		}
-	}
 
-	mergeStmt := fmt.Sprintf(
-		mergeStatementSQL,
-		strings.Join(slices.Collect(maps.Values(primaryKeyColumnCasts)), ","),
-		n.metadataSchema,
-		n.rawTableName,
-		parsedDstTable.String(),
-		flattenedCastsSQL,
-		strings.Join(primaryKeySelectSQLArray, " AND "),
-		insertColumnsSQL,
-		insertValuesSQL,
-		updateStringToastCols,
-		conflictPart,
-	)
+	var mergeStmt string
+	if useJsonbToRecord {
+		// PARTITION BY uses quoted PK column names directly — jsonb_to_record
+		// already extracted them in the CTE via r.*
+		primaryKeyQuotedNames := make([]string, 0, len(normalizedTableSchema.PrimaryKeyColumns))
+		for _, pkCol := range normalizedTableSchema.PrimaryKeyColumns {
+			primaryKeyQuotedNames = append(primaryKeyQuotedNames, common.QuoteIdentifier(pkCol))
+		}
+		mergeStmt = fmt.Sprintf(
+			mergeStatementSQLJsonbToRecord,
+			strings.Join(primaryKeyQuotedNames, ","),
+			n.metadataSchema,
+			n.rawTableName,
+			strings.Join(recordDefs, ","),
+			parsedDstTable.String(),
+			selectExprsSQL,
+			strings.Join(primaryKeySelectSQLArray, " AND "),
+			insertColumnsSQL,
+			insertValuesSQL,
+			updateStringToastCols,
+			conflictPart,
+		)
+	} else {
+		mergeStmt = fmt.Sprintf(
+			mergeStatementSQL,
+			strings.Join(slices.Collect(maps.Values(primaryKeyColumnCasts)), ","),
+			n.metadataSchema,
+			n.rawTableName,
+			parsedDstTable.String(),
+			selectExprsSQL,
+			strings.Join(primaryKeySelectSQLArray, " AND "),
+			insertColumnsSQL,
+			insertValuesSQL,
+			updateStringToastCols,
+			conflictPart,
+		)
+	}
 
 	return mergeStmt
 }
