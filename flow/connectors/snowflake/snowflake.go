@@ -373,8 +373,8 @@ func (c *SnowflakeConnector) ReplayTableSchemaDeltas(
 			}
 
 			if _, err := tableSchemaModifyTx.ExecContext(ctx,
-				fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS \"%s\" %s",
-					schemaDelta.DstTableName, strings.ToUpper(addedColumn.Name), sfColtype),
+				fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s",
+					schemaDelta.DstTableName, SnowflakeIdentifierNormalize(addedColumn.Name), sfColtype),
 			); err != nil {
 				return fmt.Errorf("failed to add column %s for table %s: %w", addedColumn.Name,
 					schemaDelta.DstTableName, err)
